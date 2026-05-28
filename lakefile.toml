@@ -1,0 +1,10 @@
+name = "catala-lean"
+version = "0.1.0"
+defaultTargets = ["catala-lean"]
+
+[[lean_lib]]
+name = "CatalaLean"
+
+[[lean_exe]]
+name = "catala-lean"
+root = "Main"

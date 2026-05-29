@@ -1,0 +1,17 @@
+# Catala tutorial
+
+## Hello, world!
+
+Your first Catala program should output the integer `42` as the
+Answer to the Ultimate Question of Life, the Universe, and Everything.
+
+```catala
+declaration scope HelloWorld:
+  output answer_everything content integer
+
+scope HelloWorld:
+  definition answer_everything equals 42
+
+```
+
+

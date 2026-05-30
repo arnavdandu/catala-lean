@@ -1,0 +1,43 @@
+# Tutorial 
+
+## Declaring a structure
+
+```catala
+declaration structure Individual: 
+    data income content money
+    data number_of_children content integer 
+```
+
+## Declaring an enumeration
+
+```catala
+declaration enumeration TaxCredit: 
+    -- NoTaxCredit 
+    -- ChildrenTaxCredit content integer
+```
+
+Combined, structures and enumerations are equivalent to algebraic data types.
+
+## Declaring a scope
+```catala
+declaration scope IncomeTaxComputation:
+    # input variables are must be provided whenever the scope is called and cannot be defined in the scope
+    input individual content Individual 
+    # internal variables are defined within the scope and cannot be seen outside the scope (i.e., it is not a part of the scope's return value)
+    internal tax_rate content decimal
+    # output variables can be computed and retrieved by the caller
+    output income_tax content money 
+    # input output A content B -- a variable can be both input and output of a scope as well
+```
+
+Scope declarations are equivalent to function signatures.
+
+## Defining a variable
+
+```catala
+scope IncomeTaxComputation:
+    definition income_tax equals 
+        individual.income * tax_rate
+```
+
+Notice we're still missing the definition of `tax_rate`. Catala's compiler will automatically collect definitions for each scope are put them in the right order, so we can safely define it later. 

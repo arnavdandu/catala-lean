@@ -142,7 +142,9 @@ inductive red : CataTerm → CataTerm → Prop where
   | if_false {ta tb} : red (.tif (.tbool false) ta tb) tb
 
   -- E-Default
-  | default {t ts tj tc} :
+  -- Side condition `hne`: an Empty alternative is handled by `default_empty`
+  -- instead; without it the relation would be nondeterministic.
+  | default {t ts tj tc} (hne : t ≠ .tempty) :
     red (.tdefault (t :: ts) tj tc)
         (.tdefault ts tj
            (.tmatch t (.tif tj tc .tempty) (.tvsome (.tvar Bruijn.zero))))
@@ -155,7 +157,9 @@ inductive red : CataTerm → CataTerm → Prop where
     red (.tdefault (.tempty :: ts) tj tc) (.tdefault ts tj tc)
 
   -- E-Fold1
-  | fold_l {f ts acc acc'} (ha : red acc acc') : red (.tfold f ts acc) (.tfold f ts acc')
+  -- Side condition `hne`: the empty-list case is handled by `fold_nil`.
+  | fold_l {f ts acc acc'} (ha : red acc acc') (hne : ts ≠ []) :
+    red (.tfold f ts acc) (.tfold f ts acc')
 
   -- E-FoldNil
   | fold_nil {f acc} : red (.tfold f [] acc) acc

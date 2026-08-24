@@ -194,6 +194,43 @@ abbrev redStar := ReflTransGen red
 /-- Transitive closure of red -/
 abbrev redPlus := TransGen red
 
+/-- `termOf` is injective — key lemma for determinism. -/
+theorem termOf_inj : ∀ (v1 v2 : Val), termOf v1 = termOf v2 → v1 = v2 := by
+  intro v1 v2 h
+  induction v1 generalizing v2 with
+  | unit =>
+    cases v2 with
+    | unit => rfl
+    | _ => simp only [termOf] at h; simp at h
+  | bool b =>
+    cases v2 <;> simp only [termOf] at h <;> simp_all [termOf]
+  | int i =>
+    cases v2 <;> simp only [termOf] at h <;> simp_all [termOf]
+  | pair v1a v1b iha ihb =>
+    cases v2 with
+    | pair v2a v2b =>
+      simp only [termOf] at h
+      injection h with h1 h2
+      rw [iha v2a h1, ihb v2b h2]
+    | _ => simp only [termOf] at h; simp at h
+  | closure k body =>
+    cases v2 <;> simp only [termOf] at h <;> simp_all [termOf]
+  | vsome v ihs =>
+    cases v2 with
+    | vsome v' =>
+      simp only [termOf] at h
+      injection h with h1
+      exact congrArg Val.vsome (ihs v' h1)
+    | _ => simp only [termOf] at h; simp at h
+  | vnone => cases v2 <;> simp only [termOf] at h <;> simp_all [termOf]
+  | vpure v ihv =>
+    cases v2 with
+    | vpure v' =>
+      simp only [termOf] at h
+      injection h with h1
+      exact congrArg Val.vpure (ihv v' h1)
+    | _ => simp only [termOf] at h; simp at h
+
 /-- Reflexivity of star -/
 lemma redStar_refl {t : CataTerm} : redStar t t := by
   apply ReflTransGen.refl

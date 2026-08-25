@@ -4,3 +4,4 @@ import CatalaLean.Syntax
 import CatalaLean.SmallStep
 import CatalaLean.TestSuite
 import CatalaLean.Typing
+import CatalaLean.Determinism

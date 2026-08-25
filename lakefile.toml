@@ -11,3 +11,8 @@ name = "Mathlib"
 scope = "leanprover"
 gitRef = "v4.33.1"
 git = "https://github.com/leanprover-community/mathlib4"
+
+[[lean_exe]]
+name = "catala-eval"
+root = "CatalaLean.EvalMain"
+supportInterpreter = false

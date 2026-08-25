@@ -3,5 +3,7 @@
 import CatalaLean.Syntax
 import CatalaLean.SmallStep
 import CatalaLean.TestSuite
+import CatalaLean.SmokeTest
 import CatalaLean.Typing
+import CatalaLean.Eval
 import CatalaLean.Determinism

@@ -368,6 +368,8 @@ def main():
         if canon(py) != canon(lean):
             print(f"[{i}] DIVERGENCE:\n  term : {expr}\n  py   : {py}\n  lean : {lean}")
             divergences += 1
+            with open(f"divergence_{args.seed or 'adhoc'}.txt", "a") as f:
+                f.write(f"term : {expr}\npy   : {py}\nlean : {lean}\n\n")
     print(f"\n{args.n} terms | divergences={divergences} | stuck(skipped)={stuck}"
           f" | mode={'MUTATED' if args.mutate else 'clean'}")
     sys.exit(1 if divergences else 0)

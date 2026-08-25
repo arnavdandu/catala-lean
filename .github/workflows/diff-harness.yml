@@ -1,0 +1,55 @@
+name: Diff Harness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *" # nightly fuzz
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+          use-github-cache: true
+      - name: Build (includes SmokeTest.lean suite)
+        run: lake build
+
+      - name: Oracle sanity check
+        run: |
+          lake exe catala-eval '(+ (int 2) (int 3))' | grep -q 'tint 5'
+          lake exe catala-eval '(errorOnEmpty (none))' | grep -q tconflict
+
+      # Smoke corpus: fast, PR-gating (<5 min)
+      - name: Differential fuzz (smoke)
+        if: github.event_name != 'schedule'
+        run: python3 scripts/diff_test.py -n 30 --seed ${{ github.run_id }}
+
+      # Nightly fuzz: larger corpus, seeded for reproducibility
+      - name: Differential fuzz (nightly)
+        if: github.event_name == 'schedule'
+        run: python3 scripts/diff_test.py -n 300 --seed $(date +%Y%m%d)
+
+      # Harness self-test: the mutated mirror MUST produce divergences,
+      # otherwise the comparator is broken.
+      - name: Mutation self-test
+        if: github.event_name != 'schedule'
+        run: |
+          if python3 scripts/diff_test.py -n 20 --seed 42 --mutate; then
+            echo "::error::Mutation self-test FAILED — harness caught nothing"
+            exit 1
+          fi
+
+      - name: Upload divergence report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: divergence-report-${{ github.run_id }}
+          path: |
+            divergence_*.txt
+          if-no-files-found: ignore

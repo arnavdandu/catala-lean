@@ -1,0 +1,24 @@
+term : (+ (+ (int -1) (int 1)) (+ (int 0) (int -15)))
+py   : tint 0
+lean : tint (-15)
+
+term : (+ (int -18) (int 0))
+py   : tint 0
+lean : tint (-18)
+
+term : (+ (int 1) (+ (int 1) (int -1)))
+py   : tint -1
+lean : tint 1
+
+term : (* (+ (int 1) (int 0)) (+ (int -1) (int 0)))
+py   : tint 0
+lean : tint (-1)
+
+term : (if (if (or (bool true) (bool false)) (bool true) (bool false)) (+ (int 1) (* (int 1) (int 0))) (+ (+ (int 16) (int -5)) (+ (int -1) (int 7))))
+py   : tint 0
+lean : tint 1
+
+term : (* (+ (int -1) (int -1)) (int 3))
+py   : tint 3
+lean : tint (-6)
+

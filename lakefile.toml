@@ -1,10 +1,18 @@
 name = "catala-lean"
 version = "0.1.0"
-defaultTargets = ["catala-lean"]
+defaultTargets = ["CatalaLean"]
 
 [[lean_lib]]
 name = "CatalaLean"
+math = false
+
+[[require]]
+name = "Mathlib"
+scope = "leanprover"
+gitRef = "v4.33.1"
+git = "https://github.com/leanprover-community/mathlib4"
 
 [[lean_exe]]
-name = "catala-lean"
-root = "Main"
+name = "catala-eval"
+root = "CatalaLean.EvalMain"
+supportInterpreter = false

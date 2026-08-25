@@ -12,15 +12,22 @@ Modes:
   --mutate       deliberately corrupt the Python mirror (+ -> *) to verify
                  the harness catches divergences (harness self-test)
   -n N           number of terms (default 50)
+  --ocaml CMD    additionally round-trip each term through the upstream OCaml
+                 compiler: wrap the expression in a generated scope, run
+                 `CMD dcalc --output-format=json`, parse the JSON AST back
+                 into a term, and require it to match the generated term.
+                 Requires the dcalc JSON export (upstream PR #1088).
 
 Exit code 0 = all agree, 1 = divergence found.
 """
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
+import tempfile
 
 # ---------------------------------------------------------------- generation
 
@@ -172,6 +179,261 @@ def to_term(ast):
     raise ValueError(f"unknown head {h}")
 
 
+# ----------------------------------------------- OCaml dcalc JSON interop
+#
+# The upstream `dcalc --output-format=json` export (PR #1088) emits nodes:
+#   {"tag":"lit","value":true|"()"|"<string>"}   ints/decimals/money as strings
+#   {"tag":"var","name":"x"}
+#   {"tag":"op","op":"<printed op>","args":[...]}
+#   {"tag":"if","cond":..,"then":..,"else":..}
+#   {"tag":"default","excepts":[nested defaults],"just":..,"cons":..}
+#   {"tag":"pure_default","e":..}
+#   {"tag":"empty"} / {"tag":"error_on_empty","e":..}
+
+OCAML_OP_MAP = {
+    # printed form (Print.operator_to_string) -> harness binop tag
+    "+!": "+", "-!": "-", "*!": "*", "/!": "/",
+    "==!": "==", "<=!": "<=", ">=!": ">=", " <!": "<", ">!": ">",
+    "&&!": "and", "||!": "or",
+    "&&": "and", "||": "or", ">=": "ge", "<=": "le",
+    "==": "eq", "<": "lt", ">": "gt",
+}
+
+
+def ocaml_op(op):
+    if op in OCAML_OP_MAP:
+        return OCAML_OP_MAP[op]
+    stripped = op.rstrip("!").rstrip("?")
+    return stripped if stripped in ("+", "*", "ge", "and", "or") else op
+
+
+def json_to_term(node):
+    """dcalc JSON AST node -> internal harness term (closed fragment)."""
+    tag = node.get("tag")
+    if tag == "lit":
+        v = node["value"]
+        if isinstance(v, bool):
+            return ("tbool", v)
+        if v == "()":
+            return "tunit"
+        try:
+            return ("tint", int(v))
+        except (TypeError, ValueError):
+            raise ValueError(f"unsupported literal: {v!r}")
+    if tag == "var":
+        # closed generated terms never carry free vars after the scope's
+        # input destructuring; a var here means the fragment leaked
+        raise ValueError(f"free variable in extracted term: {node['name']!r}")
+    if tag == "op":
+        args = [json_to_term(a) for a in node["args"]]
+        op = ocaml_op(node["op"])
+        if len(args) != 2:
+            raise ValueError(f"non-binary op {node['op']!r}")
+        return ("tbinop", op, args[0], args[1])
+    if tag == "if":
+        return ("tif", json_to_term(node["cond"]),
+                json_to_term(node["then"]), json_to_term(node["else"]))
+    if tag == "error_on_empty":
+        inner = node["e"]
+        # dcalc encodes a scope-variable definition as:
+        #   error_on_empty(default(
+        #     excepts = [ default(just=<guard>, cons=pure_default(<body>)) ... ],
+        #     just    = lit false,
+        #     cons    = empty ))
+        # Semantics: first exception whose guard is true and whose body is not
+        # empty wins; otherwise empty -> conflict. Convert the exception chain
+        # to an if-ladder: error_empty(if g1 then b1 else if g2 ... else ∅).
+        def ladder(d):
+            """Build the if-ladder term for one (nested) default node."""
+            acc = "tempty"
+            for ex in reversed(d.get("excepts", [])):
+                if ex.get("tag") != "default":
+                    raise ValueError(f"bad exception node: {ex.get('tag')!r}")
+                j, c = ex.get("just"), ex.get("cons")
+                # nested exception chains fold into the accumulator
+                if isinstance(c, dict) and c.get("tag") == "pure_default" \
+                        and isinstance(c["e"], dict) and c["e"].get("tag") == "default":
+                    acc = ladder(c["e"])
+                    continue
+                if c.get("tag") == "empty":
+                    continue
+                body = json_to_term(c["e"]) if c.get("tag") == "pure_default" \
+                    else json_to_term(c)
+                acc = ("tif", json_to_term(j), body, acc)
+            return acc
+
+        return ("terrorOnEmpty", ladder(inner))
+    if tag == "default":
+        # bare default outside error_on_empty (shouldn't occur in our fragment)
+        raise ValueError("bare default node")
+    if tag == "empty":
+        return "tempty"
+    if tag == "pure_default":
+        return ("tvpure", json_to_term(node["e"])) if False else json_to_term(node["e"])
+    if tag == "default":
+        # dcalc encodes a scope-variable definition as:
+        #   error_on_empty(default(
+        #     excepts = [ default(just=<guard>, cons=pure_default(<body>)) ... ],
+        #     just    = lit false,          (fallback guard: never take cons)
+        #     cons    = empty ))
+        # i.e. the real fallback is ∅ and each exception carries its own
+        # boolean guard. Convert to harness form: one tdefault with an
+        # exception list where guarded exceptions become
+        #   ⟨ if <guard> then <body> else ∅ ⟩  ≈ match-free encoding:
+        # we keep guards by wrapping body in tif(guard, body, tempty) — the
+        # mirror's tdefault rule treats tempty exceptions as no-ops, so a
+        # false guard degrades to skipping the exception.
+        excs = []
+
+        def walk(d):
+            for ex in d.get("excepts", []):
+                if ex.get("tag") != "default":
+                    raise ValueError(f"bad exception node: {ex.get('tag')!r}")
+                j = ex.get("just")
+                c = ex.get("cons")
+                # descend into nested exception chains first
+                if isinstance(c, dict) and c.get("tag") == "pure_default" \
+                        and isinstance(c["e"], dict) and c["e"].get("tag") == "default":
+                    walk(c["e"])
+                    continue
+                if c.get("tag") == "empty":
+                    excs.append("tempty")
+                    continue
+                body_term = json_to_term(c["e"]) if c.get("tag") == "pure_default" \
+                    else json_to_term(c)
+                guard_true = isinstance(j, dict) and j.get("tag") == "lit" \
+                    and j.get("value") is True
+                if guard_true:
+                    excs.append(body_term)
+                else:
+                    guard = json_to_term(j)
+                    excs.append(("tif", guard, body_term, "tempty"))
+
+        walk(node)
+        # fallback of the outermost default is the empty cons
+        return ("tdefault", excs, ("tbool", True), "tempty")
+    raise ValueError(f"unsupported dcalc JSON tag: {tag!r}")
+
+
+SCOPE_TEMPLATE = """```catala
+declaration scope Fuzz:
+  output out content integer
+
+scope Fuzz:
+  definition out equals {expr}
+```
+"""
+
+
+class OcamlOracle:
+    """Round-trips generated terms through the upstream OCaml compiler."""
+
+    def __init__(self, cmd, workdir=None):
+        self.cmd = cmd.split()
+        self.stdlib = os.environ.get("OCATALA_STDLIB")
+        self.workdir = workdir or tempfile.mkdtemp(prefix="diff_ocaml_")
+        os.makedirs(self.workdir, exist_ok=True)
+
+    def _run(self, extra):
+        return subprocess.run(
+            self.cmd + ["dcalc"] + extra,
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def roundtrip(self, term):
+        """Returns ('ok', term) or ('skip', reason)."""
+        expr = term_to_catala_expr(to_catala_term(term))
+        if expr is None:
+            return "skip", "outside catala-surface fragment"
+        path = os.path.join(self.workdir, "fuzz.catala_en")
+        with open(path, "w") as f:
+            f.write(SCOPE_TEMPLATE.replace("{expr}", expr))
+        extra = ["--output-format=json", "-s", "Fuzz", path]
+        if self.stdlib:
+            extra = ["--stdlib", self.stdlib] + extra
+        p = self._run(extra)
+        if p.returncode != 0 or "could not be found" in p.stderr:
+            if self.stdlib is None and "Stdlib" in (p.stderr + p.stdout):
+                return "skip", "needs --stdlib; pass a libcatala dir via OCATALA_STDLIB"
+            return "skip", f"catala rejected: {(p.stderr.strip().splitlines() or [''])[-1:]}"
+        try:
+            data = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            return "skip", "invalid JSON from dcalc"
+        body = data[0]["scope"]
+        sets = [l for l in body["lets"] if l["kind"] == "set"]
+        target = sets[-1]["expr"] if sets else body["return"]
+        try:
+            got = json_to_term(target)
+        except ValueError as e:
+            return "skip", f"JSON outside fragment ({e})"
+        return "ok", got
+
+
+def term_to_catala_expr(term):
+    """Internal term -> Catala surface expression (integer fragment + defaults).
+    Only used for terms the generator produces (no options/pairs needed at the
+    top level; those are skipped by the caller)."""
+    if isinstance(term, str):
+        return {"tempty": "∅", "tconflict": "conflict", "tvnone": "none"}.get(term)
+    h = term[0]
+    if h == "tint":
+        return str(term[1])
+    if h == "tbool":
+        return "true" if term[1] else "false"
+    if h == "tbinop":
+        sym = {"+": "+", "*": "*", "ge": ">=", "and": "and", "or": "or"}.get(term[1])
+        if sym is None:
+            return None
+        a = term_to_catala_expr(term[2])
+        b = term_to_catala_expr(term[3])
+        if a is None or b is None:
+            return None
+        # always parenthesize operands: Catala precedence differs from the
+        # flat s-expr tree (e.g. -1 * 1 + -8 parses as (-1*1) + -8)
+        return f"({a} {sym} {b})"
+    if h == "tif":
+        c = term_to_catala_expr(term[1])
+        a = term_to_catala_expr(term[2])
+        b = term_to_catala_expr(term[3])
+        if None in (c, a, b):
+            return None
+        return f"(if {c} then {a} else {b})"
+    if h == "terrorOnEmpty":
+        x = term_to_catala_expr(term[1])
+        return None if x is None else f"error_empty ⟨ {x} ⟩"
+    if h == "tdefault":
+        excs, tj, tc = term
+        parts = []
+        for ex in excs:
+            e = term_to_catala_expr(ex)
+            if e is None:
+                return None
+            parts.append(f"⟨ true ⊢ {e} ⟩")
+        j = term_to_catala_expr(tj)
+        c = term_to_catala_expr(tc)
+        if j is None or c is None:
+            return None
+        inner = " | ".join(parts + [f"{j} ⊢ {c}"]) if parts else f"{j} ⊢ {c}"
+        return f"⟨ {inner} ⟩"
+    return None
+
+
+
+def to_catala_term(t):
+    """Normalize harness term to the subset expressible in Catala surface
+    syntax: drop tvsome/tvpure wrappers introduced by generation."""
+    if isinstance(t, tuple) and t[0] in ("tvsome", "tvpure"):
+        return to_catala_term(t[1])
+    if isinstance(t, tuple):
+        return tuple(to_catala_term(x) if isinstance(x, tuple) else
+                     ([to_catala_term(y) for y in x] if isinstance(x, list) else x)
+                     for x in t)
+    if isinstance(t, list):
+        return [to_catala_term(x) for x in t]
+    return t
+
+
 # ------------------------------------------------------- evaluator (mirror)
 
 class Stuck(Exception):
@@ -200,7 +462,7 @@ BINOP = {
     "+": lambda a, b: ("tint", a[1] + b[1]),
     "*": lambda a, b: ("tint", a[1] * b[1]),
     "ge": lambda a, b: ("tbool", a[1] >= b[1]),
-    "and": lambda a, b: ("tbool", a[1] and b[1]),
+    ">=": lambda a, b: ("tbool", a[1] >= b[1]),    "and": lambda a, b: ("tbool", a[1] and b[1]),
     "or": lambda a, b: ("tbool", a[1] or b[1]),
 }
 
@@ -255,6 +517,8 @@ def step(t, mutate=False):
             return "tconflict"
         if isinstance(x, tuple) and x[0] == "tvsome":
             return x[1]
+        if isinstance(x, str) or (isinstance(x, tuple) and is_val(x)):
+            return ("tvsome", x)  # value body: wrap like the Lean rule
         sx = step(x, mutate)
         return None if sx is None else ("terrorOnEmpty", sx)
     if h == "tdefaultPure":
@@ -348,15 +612,48 @@ def main():
     ap.add_argument("--mutate", action="store_true",
                     help="corrupt the Python mirror to self-test the harness")
     ap.add_argument("--repo", default=".")
+    ap.add_argument("--ocaml", default=None, metavar="CMD",
+                    help="path to a catala binary with the dcalc JSON export "
+                         "(e.g. ~/Exploration/catala/_build/default/compiler/catala.exe); "
+                         "enables the OCaml round-trip oracle")
     args = ap.parse_args()
     REPO = args.repo
+
+    ocaml = OcamlOracle(args.ocaml) if args.ocaml else None
 
     rnd = random.Random(args.seed)
     divergences = 0
     stuck = 0
+    ocaml_checked = 0
+    ocaml_skipped = 0
     for i in range(args.n):
         expr = gen_term(rnd, rnd.randint(1, 4))
-        py = evaluate(to_term(parse(tokenize(expr))[0]), args.fuel, mutate=args.mutate)
+        term = to_term(parse(tokenize(expr))[0])
+        py = evaluate(term, args.fuel, mutate=args.mutate)
+
+        if ocaml is not None:
+            status, payload = ocaml.roundtrip(term)
+            if status == "ok":
+                ocaml_checked += 1
+                # the scope wraps results in an option via error_empty:
+                # evaluate the OCaml-parsed term with the mirror and strip
+                # the top-level tvsome wrapper before comparing.
+                try:
+                    oc = evaluate(payload, args.fuel)
+                except Stuck:
+                    oc = "STUCK"
+                if isinstance(oc, str) and oc.startswith("tvsome "):
+                    oc = oc[len("tvsome "):]
+                py_nf = evaluate(term, args.fuel, mutate=args.mutate)
+                if oc != "STUCK" and canon(oc) != canon(py_nf):
+                    print(f"[{i}] OCAML DIVERGENCE:\n  term  : {expr}\n"
+                          f"  py    : {py_nf}\n  ocaml : {oc}")
+                    divergences += 1
+                    with open(f"divergence_ocaml_{args.seed or 'adhoc'}.txt", "a") as f:
+                        f.write(f"term : {expr}\npy   : {py_nf}\nocaml: {oc}\n\n")
+            else:
+                ocaml_skipped += 1
+
         lean, rc = run_lean(expr, args.fuel)
         if lean.strip().startswith('{"error"'):
             print(f"[{i}] LEAN ERROR ({lean.strip()}): {expr}")
@@ -370,8 +667,11 @@ def main():
             divergences += 1
             with open(f"divergence_{args.seed or 'adhoc'}.txt", "a") as f:
                 f.write(f"term : {expr}\npy   : {py}\nlean : {lean}\n\n")
+    extra = ""
+    if ocaml is not None:
+        extra = f" | ocaml_roundtrip={ocaml_checked} ocaml_skipped={ocaml_skipped}"
     print(f"\n{args.n} terms | divergences={divergences} | stuck(skipped)={stuck}"
-          f" | mode={'MUTATED' if args.mutate else 'clean'}")
+          f"{extra} | mode={'MUTATED' if args.mutate else 'clean'}")
     sys.exit(1 if divergences else 0)
 
 
